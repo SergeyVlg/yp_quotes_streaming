@@ -1,0 +1,10 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rand = "0.10.0"
+parking_lot = "0.12.5"
+crossbeam-channel = "0.5.15"
+shared = { path = "../shared" }
