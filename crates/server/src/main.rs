@@ -1,20 +1,20 @@
+mod quote_generator;
+mod stock_exchange;
+mod stock_quote;
+
+use crate::stock_exchange::StockExchange;
 use crate::stock_quote::StockQuote;
 use crossbeam_channel::{bounded, Sender, TrySendError};
 use parking_lot::RwLock;
 use shared::StreamCommand;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{io, thread};
-use std::collections::HashMap;
-use stock_exchange::StockExchange;
 
-mod quote_generator;
-mod stock_exchange;
-mod stock_quote;
-
-type SenderInfo = (Sender<Vec<StockQuote>>, Vec<String>);
+type SenderInfo = Sender<Arc<HashMap<String, StockQuote>>>;
 type Subscribers = Arc<RwLock<Vec<SenderInfo>>>;
 
 fn main() -> Result<(), io::Error> {
@@ -22,26 +22,30 @@ fn main() -> Result<(), io::Error> {
     let mut stock_exchange = StockExchange::new("AAPL,MSFT,TSLA".to_string()); //read file with quotes
     let generator = quote_generator::QuoteGenerator;
     let subscribers: Subscribers = Arc::new(RwLock::new(Vec::new()));
+    let subscribers_to_write = Arc::clone(&subscribers);
 
     thread::spawn(move || {
         loop {
             stock_exchange.update_quotes(&generator);
-            let snapshot: HashMap<String, StockQuote> = stock_exchange.quotes.clone();
+            let snapshot = Arc::new(stock_exchange.quotes.clone());
 
-            let mut subs = subscribers.write();
-            subs.retain(|sender_info| {
-                let (sender, requested_quotes) = sender_info; //возможно, стоит вынести отправку через каналы в отдельный поток
+            { // Блок для записи в subscribers, чтобы не держать блокировку на весь цикл
+                let mut subs = subscribers_to_write.write();
 
-                // Фильтруем котировки по запрошенным тикерам
-                let payload: Vec<StockQuote> = requested_quotes.iter().map(|q| snapshot.get(q).cloned()).flatten().collect();
+                subs.retain(|sender| {
+                    //возможно, стоит вынести отправку через каналы в отдельный поток
 
-                // Отправляем обновления клиенту, если он все еще подключен
-                match sender.try_send(payload) {
-                    Ok(_) => true, // Клиент получил обновление, оставляем его в списке
-                    Err(TrySendError::Full(_)) => true, // Канал полон, пропускаем такт
-                    Err(_) => false, // Клиент отключился, удаляем его из списка
-                }
-            });
+                    // Фильтруем котировки по запрошенным тикерам
+                    //let payload: Vec<StockQuote> = requested_quotes.iter().map(|q| snapshot.get(q).cloned()).flatten().collect();
+                    let snapshot = Arc::clone(&snapshot);
+
+                    match sender.try_send(snapshot) {
+                        Ok(_) => true, // Клиент получил обновление, оставляем его в списке
+                        Err(TrySendError::Full(_)) => true, // Канал полон, пропускаем такт
+                        Err(_) => false, // Клиент отключился, удаляем его из списка
+                    }
+                });
+            }
 
             thread::sleep(Duration::from_secs(5));
         }
@@ -55,8 +59,10 @@ fn main() -> Result<(), io::Error> {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                let subscribers = Arc::clone(&subscribers);
+
                 thread::spawn(move || {
-                    let _ = handle_client(stream);
+                    let _ = handle_client(stream, subscribers);
                 });
             }
             Err(e) => return Err(e),
@@ -67,8 +73,9 @@ fn main() -> Result<(), io::Error> {
 }
 
 // Логика обработки клиента
-fn handle_client(stream: TcpStream) {
+fn handle_client(stream: TcpStream, subscribers: Subscribers) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
     let mut writer = stream.try_clone().expect("failed to clone stream"); //убрать expect, завершать функцию с логом ошибки через логгер
     let mut reader = BufReader::new(stream);
 
@@ -80,16 +87,41 @@ fn handle_client(stream: TcpStream) {
             match StreamCommand::try_from_bytes(&bytes) {
                 Ok(command) => {
                     println!("Parsed command: {:?}", command);
-                    // Здесь нужно запустить поток для отправки данных по UDP на указанный адрес и порт
-                    // А также передать канал для получения котировок из биржи и фильтрации по запрошенным тикерам
-                    // Канал надо создавать в main и передавать в handle_client, а не создавать новый для каждого клиента
-                    // Каждому клиенту нужны свои акции, поэтому надо регистрировать клиента в subscribers и отправлять ему обновления через каналы, а не напрямую через UDP
 
-                    let socket = UdpSocket::bind("127.0.0.1")?;
+                    thread::spawn(move || {
+                        let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
+                            eprintln!("Failed to bind UDP socket");
+                            return;
+                        };
 
+                        let (sender, receiver) = bounded::<Arc<HashMap<String, StockQuote>>>(20);
+                        {
+                            let mut subscribers_lock = subscribers.write();
+                            subscribers_lock.push(sender);
+                        }
 
+                        loop {
+                            //todo необходимо удалять отключившихся клиентов из subscribers
+                            match receiver.recv() {
+                                Ok(all_quotes) => {
+                                    // Фильтруем котировки по запрошенным тикерам
+                                    let payload: Vec<StockQuote> = command.quotes.iter().filter_map(|required_quote| all_quotes.get(required_quote).cloned()).collect();
 
+                                    //здесь нужно сериализовывать котировки в поток байт с разделителем между котировками, типа |
+                                    let payload_bytes = payload.iter().flat_map(|quote| quote.to_bytes()).collect::<Vec<u8>>();
 
+                                    if let Err(e) = socket.send_to(&payload_bytes, command.get_socket_address()) {
+                                        eprintln!("Failed to send UDP packet: {}", e);
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to receive quotes from channel: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    });
                 }
                 Err(e) => {
                     let _ = writer.write_all(format!("Error parsing command: {}\n", e).as_bytes());

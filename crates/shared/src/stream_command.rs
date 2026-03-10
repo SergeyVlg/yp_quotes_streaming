@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::FromStr;
 use clap::Parser;
 
@@ -18,7 +18,7 @@ struct StreamRawCommand {
 pub struct StreamCommand {
     address: Ipv4Addr,
     port: u16,
-    quotes: Vec<String>
+    pub quotes: Vec<String>
 }
 
 impl TryFrom<StreamRawCommand> for StreamCommand {
@@ -53,6 +53,14 @@ impl TryFrom<StreamRawCommand> for StreamCommand {
 impl StreamCommand {
     pub const MAX_COMMAND_SIZE: u64 = 4096;
     const FIELDS_COUNT: usize = 4; //STREAM|Address|Port|Quote1,Quote2,...
+
+    pub fn new(address: Ipv4Addr, port: u16, quotes: Vec<String>) -> Self {
+        StreamCommand { address, port, quotes }
+    }
+
+    pub fn get_socket_address(&self) -> SocketAddrV4 {
+        SocketAddrV4::new(self.address, self.port)
+    }
 
     fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
