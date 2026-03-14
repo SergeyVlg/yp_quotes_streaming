@@ -25,7 +25,6 @@ impl StockQuote {
         }
     }
 
-    // Или бинарная сериализация
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(self.ticker.as_bytes());
@@ -36,5 +35,10 @@ impl StockQuote {
         bytes.push(b'|');
         bytes.extend_from_slice(self.timestamp.to_string().as_bytes());
         bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let s = std::str::from_utf8(bytes).ok()?;
+        Self::from_string(s)
     }
 }

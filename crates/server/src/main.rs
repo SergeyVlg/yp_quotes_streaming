@@ -13,45 +13,24 @@ use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{io, thread};
+use crate::quote_generator::QuoteGenerator;
 
 type SenderInfo = Sender<Arc<HashMap<String, StockQuote>>>;
 type Subscribers = Arc<RwLock<Vec<SenderInfo>>>;
 
+const ADDRESS: &str = "127.0.0.1:7878";
+const CHANNEL_CAPACITY: usize = 20;
+
 fn main() -> Result<(), io::Error> {
     //Поток обновления котировок - только он может записывать данные в биржу, а клиенты только читают
-    let mut stock_exchange = StockExchange::new("AAPL,MSFT,TSLA".to_string()); //read file with quotes
+    let stock_exchange = StockExchange::new("AAPL,MSFT,TSLA".to_string()); //read file with quotes
     let generator = quote_generator::QuoteGenerator;
     let subscribers: Subscribers = Arc::new(RwLock::new(Vec::new()));
     let subscribers_to_write = Arc::clone(&subscribers);
 
     thread::spawn(move || {
-        loop {
-            stock_exchange.update_quotes(&generator);
-            let snapshot = Arc::new(stock_exchange.quotes.clone());
-
-            { // Блок для записи в subscribers, чтобы не держать блокировку на весь цикл
-                let mut subs = subscribers_to_write.write();
-
-                subs.retain(|sender| {
-                    //возможно, стоит вынести отправку через каналы в отдельный поток
-
-                    // Фильтруем котировки по запрошенным тикерам
-                    //let payload: Vec<StockQuote> = requested_quotes.iter().map(|q| snapshot.get(q).cloned()).flatten().collect();
-                    let snapshot = Arc::clone(&snapshot);
-
-                    match sender.try_send(snapshot) {
-                        Ok(_) => true, // Клиент получил обновление, оставляем его в списке
-                        Err(TrySendError::Full(_)) => true, // Канал полон, пропускаем такт
-                        Err(_) => false, // Клиент отключился, удаляем его из списка
-                    }
-                });
-            }
-
-            thread::sleep(Duration::from_secs(5));
-        }
+        update_quotes(stock_exchange, &generator, subscribers_to_write);
     });
-
-    const ADDRESS: &str = "127.0.0.1:7878";
 
     let listener = TcpListener::bind(ADDRESS)?;
     println!("Server listening {}", ADDRESS);
@@ -72,7 +51,31 @@ fn main() -> Result<(), io::Error> {
     Ok(())
 }
 
-// Логика обработки клиента
+fn update_quotes(mut stock_exchange: StockExchange, generator: &QuoteGenerator, subscribers_to_write: Arc<RwLock<Vec<SenderInfo>>>) {
+    loop {
+        stock_exchange.update_quotes(&generator);
+        let snapshot = Arc::new(stock_exchange.quotes.clone());
+
+        // Блок для записи в subscribers, чтобы не держать блокировку на весь цикл
+        {
+            let mut subs = subscribers_to_write.write();
+
+            subs.retain(|sender| {
+                let snapshot = Arc::clone(&snapshot);
+
+                match sender.try_send(snapshot) {
+                    Ok(_) => true, // Клиент получил обновление, оставляем его в списке
+                    Err(TrySendError::Full(_)) => true, // Канал полон, пропускаем такт
+                    Err(_) => false, // Клиент отключился, удаляем его из списка
+                }
+            });
+        }
+
+        thread::sleep(Duration::from_secs(5));
+    }
+}
+
+// Логика обработки подключившегося по TCP клиента
 fn handle_client(stream: TcpStream, subscribers: Subscribers) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
 
@@ -88,39 +91,11 @@ fn handle_client(stream: TcpStream, subscribers: Subscribers) {
                 Ok(command) => {
                     println!("Parsed command: {:?}", command);
 
+                    let _ = writer.write_all("Command accepted, starting udp stream...\n".as_bytes());
+                    let _ = writer.flush();
+
                     thread::spawn(move || {
-                        let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
-                            eprintln!("Failed to bind UDP socket");
-                            return;
-                        };
-
-                        let (sender, receiver) = bounded::<Arc<HashMap<String, StockQuote>>>(20);
-                        {
-                            let mut subscribers_lock = subscribers.write();
-                            subscribers_lock.push(sender);
-                        }
-
-                        loop {
-                            //todo необходимо удалять отключившихся клиентов из subscribers
-                            match receiver.recv() {
-                                Ok(all_quotes) => {
-                                    // Фильтруем котировки по запрошенным тикерам
-                                    let payload: Vec<StockQuote> = command.quotes.iter().filter_map(|required_quote| all_quotes.get(required_quote).cloned()).collect();
-
-                                    //здесь нужно сериализовывать котировки в поток байт с разделителем между котировками, типа |
-                                    let payload_bytes = payload.iter().flat_map(|quote| quote.to_bytes()).collect::<Vec<u8>>();
-
-                                    if let Err(e) = socket.send_to(&payload_bytes, command.get_socket_address()) {
-                                        eprintln!("Failed to send UDP packet: {}", e);
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to receive quotes from channel: {}", e);
-                                    break;
-                                }
-                            }
-                        }
+                        process_udp_streaming(subscribers, command);
                     });
                 }
                 Err(e) => {
@@ -131,7 +106,46 @@ fn handle_client(stream: TcpStream, subscribers: Subscribers) {
                 }
             }
         }
-        Err(_) => {}
+        Err(e) => {
+            let _ = writer.write_all(format!("Error command format: {}\n", e).as_bytes());
+            let _ = writer.flush();
+        }
+    }
+}
+
+fn process_udp_streaming(subscribers: Subscribers, command: StreamCommand) {
+    let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
+        eprintln!("Failed to bind UDP socket");
+        return ();
+    };
+
+    let (sender, receiver) = bounded::<Arc<HashMap<String, StockQuote>>>(CHANNEL_CAPACITY);
+    {
+        let mut subscribers_lock = subscribers.write();
+        subscribers_lock.push(sender);
+    }
+
+    loop {
+        match receiver.recv() {
+            Ok(all_quotes) => {
+                let filtered_quotes: Vec<StockQuote> = command.quotes.iter()
+                    .filter_map(|required_quote| all_quotes.get(required_quote).cloned())
+                    .collect();
+
+                let payload_bytes: Vec<u8> = filtered_quotes.iter()
+                    .flat_map(|quote: &StockQuote| quote.to_bytes())
+                    .collect();
+
+                if let Err(e) = socket.send_to(&payload_bytes, command.get_socket_address()) {
+                    eprintln!("Failed to send UDP packet: {}", e);
+                    break;
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to receive quotes from channel: {}", e);
+                break;
+            }
+        }
     }
 }
 
