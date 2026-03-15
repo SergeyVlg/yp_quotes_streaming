@@ -1,15 +1,13 @@
 mod quote_generator;
 mod stock_exchange;
-mod stock_quote;
 
 use crate::stock_exchange::StockExchange;
-use crate::stock_quote::StockQuote;
 use crossbeam_channel::{bounded, Sender, TrySendError};
 use parking_lot::RwLock;
-use shared::StreamCommand;
+use shared::{StockQuote, StreamCommand};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{io, thread};
@@ -18,16 +16,19 @@ use crate::quote_generator::QuoteGenerator;
 type SenderInfo = Sender<Arc<HashMap<String, StockQuote>>>;
 type Subscribers = Arc<RwLock<Vec<SenderInfo>>>;
 
-const ADDRESS: &str = "127.0.0.1:7878";
+const TICKERS_FILE: &str = "tickers.txt";
+const ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 7878);
 const CHANNEL_CAPACITY: usize = 20;
 
 fn main() -> Result<(), io::Error> {
-    //Поток обновления котировок - только он может записывать данные в биржу, а клиенты только читают
-    let stock_exchange = StockExchange::new("AAPL,MSFT,TSLA".to_string()); //read file with quotes
-    let generator = quote_generator::QuoteGenerator;
+    let tickers = read_tickers(TICKERS_FILE)?;
+    let stock_exchange = StockExchange::new(tickers);
+
+    let generator = QuoteGenerator;
     let subscribers: Subscribers = Arc::new(RwLock::new(Vec::new()));
     let subscribers_to_write = Arc::clone(&subscribers);
 
+    //Поток обновления котировок - только он может записывать данные в биржу, а клиенты только читают
     thread::spawn(move || {
         update_quotes(stock_exchange, &generator, subscribers_to_write);
     });
@@ -51,14 +52,35 @@ fn main() -> Result<(), io::Error> {
     Ok(())
 }
 
-fn update_quotes(mut stock_exchange: StockExchange, generator: &QuoteGenerator, subscribers_to_write: Arc<RwLock<Vec<SenderInfo>>>) {
+fn read_tickers(path: &str) -> io::Result<Vec<String>> {
+    let file = std::fs::File::open(path)?;
+    let reader = BufReader::new(file);
+
+    let mut tickers = Vec::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            tickers.push(trimmed.to_string());
+        }
+    }
+
+    if tickers.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Файл с тикерами пустой: {}", path)));
+    }
+
+    Ok(tickers)
+}
+
+fn update_quotes(mut stock_exchange: StockExchange, generator: &QuoteGenerator, subscribers: Arc<RwLock<Vec<SenderInfo>>>) {
     loop {
         stock_exchange.update_quotes(&generator);
         let snapshot = Arc::new(stock_exchange.quotes.clone());
 
         // Блок для записи в subscribers, чтобы не держать блокировку на весь цикл
         {
-            let mut subs = subscribers_to_write.write();
+            let mut subs = subscribers.write();
 
             subs.retain(|sender| {
                 let snapshot = Arc::clone(&snapshot);
@@ -77,12 +99,14 @@ fn update_quotes(mut stock_exchange: StockExchange, generator: &QuoteGenerator, 
 
 // Логика обработки подключившегося по TCP клиента
 fn handle_client(stream: TcpStream, subscribers: Subscribers) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    println!("Connection from {}", stream.peer_addr().unwrap());
+
+    //let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
 
     let mut writer = stream.try_clone().expect("failed to clone stream"); //убрать expect, завершать функцию с логом ошибки через логгер
     let mut reader = BufReader::new(stream);
 
-    let _ = writer.write_all(b"Start streaming quotes!\n");
+    let _ = writer.write_all(b"Welcome to streaming quotes server! Awaiting command...\n");
     let _ = writer.flush();
 
     match read_command_bounded(&mut reader, StreamCommand::MAX_COMMAND_SIZE) {
@@ -91,7 +115,7 @@ fn handle_client(stream: TcpStream, subscribers: Subscribers) {
                 Ok(command) => {
                     println!("Parsed command: {:?}", command);
 
-                    let _ = writer.write_all("Command accepted, starting udp stream...\n".as_bytes());
+                    let _ = writer.write_all(b"Ack\n");
                     let _ = writer.flush();
 
                     thread::spawn(move || {
@@ -99,6 +123,8 @@ fn handle_client(stream: TcpStream, subscribers: Subscribers) {
                     });
                 }
                 Err(e) => {
+                    eprintln!("Error parsing command: {}\n", e);
+
                     let _ = writer.write_all(format!("Error parsing command: {}\n", e).as_bytes());
                     let _ = writer.flush();
 
@@ -107,6 +133,8 @@ fn handle_client(stream: TcpStream, subscribers: Subscribers) {
             }
         }
         Err(e) => {
+            eprintln!("Error command format: {:?}\n", e);
+
             let _ = writer.write_all(format!("Error command format: {}\n", e).as_bytes());
             let _ = writer.flush();
         }
@@ -125,16 +153,23 @@ fn process_udp_streaming(subscribers: Subscribers, command: StreamCommand) {
         subscribers_lock.push(sender);
     }
 
+    println!("Start processing UDP streaming...");
+
     loop {
         match receiver.recv() {
             Ok(all_quotes) => {
+                //todo Для отслеживания, активен ли еще клиент, необходима отдельная структура данных, которая будет хранить активных клиентов
+                //как только механизм ping/pong сообщает о неактивности клиента, надо удалить его из этой структуры
+                //здесь же перед отправкой данных надо проверять, активен ли еще клиент, и если нет, то просто дропнуть receiver.
+                //это автоматически удалит клиента из subscribers при следующем такте обновления котировок, в методе вектора retain
+
                 let filtered_quotes: Vec<StockQuote> = command.quotes.iter()
                     .filter_map(|required_quote| all_quotes.get(required_quote).cloned())
                     .collect();
 
-                let payload_bytes: Vec<u8> = filtered_quotes.iter()
-                    .flat_map(|quote: &StockQuote| quote.to_bytes())
-                    .collect();
+                let payload_bytes: Vec<u8> = StockQuote::serialize(&filtered_quotes);
+
+                println!("Send quotes to {}: {:?}", command.get_socket_address(), filtered_quotes);
 
                 if let Err(e) = socket.send_to(&payload_bytes, command.get_socket_address()) {
                     eprintln!("Failed to send UDP packet: {}", e);
@@ -151,6 +186,7 @@ fn process_udp_streaming(subscribers: Subscribers, command: StreamCommand) {
 
 fn read_command_bounded(reader: &mut BufReader<TcpStream>, max_command_size: u64) -> io::Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(256);
+    println!("Start reading command with max size {}", max_command_size);
 
     let n = reader
         .take(max_command_size + 1)

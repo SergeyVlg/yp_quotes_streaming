@@ -1,18 +1,18 @@
 use std::collections::HashMap;
+use shared::StockQuote;
 use crate::quote_generator::QuoteGenerator;
-use crate::stock_quote::StockQuote;
 
 pub(super) struct StockExchange {
     pub(super) quotes: HashMap<String, StockQuote>,
 }
 
 impl StockExchange {
-    pub(super) fn new(quotes: String) -> Self {
+    pub(super) fn new(tickers: Vec<String>) -> Self {
         let mut stock_quotes = HashMap::new();
 
-        for quote_str in quotes.split(',') {
-            stock_quotes.insert(quote_str.to_string(), StockQuote {
-                ticker: quote_str.to_string(),
+        for ticker in tickers {
+            stock_quotes.insert(ticker.to_string(), StockQuote {
+                ticker: ticker.to_string(),
                 price: 0.0,
                 volume: 0,
                 timestamp: 0,
