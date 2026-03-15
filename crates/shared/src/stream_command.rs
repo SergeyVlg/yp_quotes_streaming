@@ -1,52 +1,10 @@
-use clap::Parser;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::FromStr;
-
-#[derive(Parser, Debug)]
-pub struct StreamRawCommand {
-    #[arg(value_name = "\"STREAM\"")]
-    command: String,
-
-    #[arg(value_name = "udp://ADDRESS:PORT")]
-    address: String,
-
-    #[arg(value_name = "QUOTE1,QUOTE2,...")]
-    quotes: String
-}
 
 #[derive(Debug)]
 pub struct StreamCommand {
     address: SocketAddrV4,
     pub quotes: Vec<String>
-}
-
-impl TryFrom<StreamRawCommand> for StreamCommand {
-    type Error = String;
-
-    fn try_from(value: StreamRawCommand) -> Result<Self, Self::Error> {
-        if value.command != "STREAM" {
-            return Err(format!("Invalid command: {}", value.command));
-        }
-
-        let parts: Vec<&str> = value.address.split("://").collect();
-        if parts.len() != 2 || parts[0] != "udp" {
-            return Err(format!("Invalid address format: {}", value.address));
-        }
-
-        let addr_parts: Vec<&str> = parts[1].split(':').collect();
-        if addr_parts.len() != 2 {
-            return Err(format!("Only single colon support: {}", value.address));
-        }
-
-        let ip_address = Ipv4Addr::from_str(addr_parts[0]).map_err(|e| format!("Invalid IPv4 address format: {}", e))?;
-        let port = addr_parts[1].parse::<u16>().map_err(|e| format!("Invalid port number: {}", e))?;
-        let address = SocketAddrV4::new(ip_address, port);
-
-        Ok(StreamCommand {
-            address,
-            quotes: value.quotes.split(',').map(|s| s.trim().to_string()).collect()
-        })
-    }
 }
 
 impl StreamCommand {
