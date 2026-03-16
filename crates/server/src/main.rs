@@ -101,7 +101,7 @@ fn update_quotes(mut stock_exchange: StockExchange, generator: &QuoteGenerator, 
 fn handle_client(stream: TcpStream, subscribers: Subscribers) {
     println!("Connection from {}", stream.peer_addr().unwrap());
 
-    //let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
 
     let mut writer = stream.try_clone().expect("failed to clone stream"); //убрать expect, завершать функцию с логом ошибки через логгер
     let mut reader = BufReader::new(stream);
@@ -109,33 +109,21 @@ fn handle_client(stream: TcpStream, subscribers: Subscribers) {
     let _ = writer.write_all(b"Welcome to streaming quotes server! Awaiting command...\n");
     let _ = writer.flush();
 
-    match read_command_bounded(&mut reader, StreamCommand::MAX_COMMAND_SIZE) {
-        Ok(bytes) => {
-            match StreamCommand::try_from_bytes(&bytes) {
-                Ok(command) => {
-                    println!("Parsed command: {:?}", command);
+    match StreamCommand::try_read_from_reader(&mut reader) {
+        Ok(command) => {
+            println!("Parsed command: {:?}", command);
 
-                    let _ = writer.write_all(b"Ack\n");
-                    let _ = writer.flush();
+            let _ = writer.write_all(b"Ack\n");
+            let _ = writer.flush();
 
-                    thread::spawn(move || {
-                        process_udp_streaming(subscribers, command);
-                    });
-                }
-                Err(e) => {
-                    eprintln!("Error parsing command: {}\n", e);
-
-                    let _ = writer.write_all(format!("Error parsing command: {}\n", e).as_bytes());
-                    let _ = writer.flush();
-
-                    return; // Закрываем соединение после отправки ошибки
-                }
-            }
+            thread::spawn(move || {
+                process_udp_streaming(subscribers, command);
+            });
         }
         Err(e) => {
-            eprintln!("Error command format: {:?}\n", e);
+            eprintln!("Error parsing command: {}\n", e);
 
-            let _ = writer.write_all(format!("Error command format: {}\n", e).as_bytes());
+            let _ = writer.write_all(format!("Error parsing command: {}\n", e).as_bytes());
             let _ = writer.flush();
         }
     }
@@ -169,9 +157,9 @@ fn process_udp_streaming(subscribers: Subscribers, command: StreamCommand) {
 
                 let payload_bytes: Vec<u8> = StockQuote::serialize(&filtered_quotes);
 
-                println!("Send quotes to {}: {:?}", command.get_socket_address(), filtered_quotes);
+                println!("Send quotes to {}: {:?}", command.address, filtered_quotes);
 
-                if let Err(e) = socket.send_to(&payload_bytes, command.get_socket_address()) {
+                if let Err(e) = socket.send_to(&payload_bytes, command.address) {
                     eprintln!("Failed to send UDP packet: {}", e);
                     break;
                 }
@@ -182,34 +170,4 @@ fn process_udp_streaming(subscribers: Subscribers, command: StreamCommand) {
             }
         }
     }
-}
-
-fn read_command_bounded(reader: &mut BufReader<TcpStream>, max_command_size: u64) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(256);
-    println!("Start reading command with max size {}", max_command_size);
-
-    let n = reader
-        .take(max_command_size + 1)
-        .read_until(b'\n', &mut buf)?;
-
-    if n == 0 {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed"));
-    }
-
-    if buf.len() > max_command_size as usize {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "command too long"));
-    }
-
-    if !buf.ends_with(b"\n") {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "newline not found"));
-    }
-
-    if matches!(buf.last(), Some(b'\n')) {
-        buf.pop();
-    }
-    if matches!(buf.last(), Some(b'\r')) {
-        buf.pop();
-    }
-
-    Ok(buf)
 }
