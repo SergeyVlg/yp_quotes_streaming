@@ -2,19 +2,22 @@ mod quote_generator;
 mod stock_exchange;
 
 use crate::stock_exchange::StockExchange;
+use crate::quote_generator::QuoteGenerator;
 use crossbeam_channel::{bounded, Sender, TrySendError};
 use parking_lot::RwLock;
 use shared::{StockQuote, StreamCommand};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{io, thread};
-use crate::quote_generator::QuoteGenerator;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::Relaxed;
 
 type SenderInfo = Sender<Arc<HashMap<String, StockQuote>>>;
 type Subscribers = Arc<RwLock<Vec<SenderInfo>>>;
+type ActiveClients = Arc<RwLock<HashMap<u64, bool>>>;
 
 const TICKERS_FILE: &str = "tickers.txt";
 const ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 7878);
@@ -26,6 +29,10 @@ fn main() -> Result<(), io::Error> {
 
     let generator = QuoteGenerator;
     let subscribers: Subscribers = Arc::new(RwLock::new(Vec::new()));
+
+    let last_client_id: AtomicU64 = AtomicU64::new(0); //последний использованный id для генерации нового
+    let active_clients: Arc<RwLock<HashMap<u64, bool>>> = Arc::new(RwLock::new(HashMap::new())); //id клиента - активен он или нет
+
     let subscribers_to_write = Arc::clone(&subscribers);
 
     //Поток обновления котировок - только он может записывать данные в биржу, а клиенты только читают
@@ -40,9 +47,14 @@ fn main() -> Result<(), io::Error> {
         match stream {
             Ok(stream) => {
                 let subscribers = Arc::clone(&subscribers);
+                let mut cloned_stream = stream.try_clone()?;
 
                 thread::spawn(move || {
-                    let _ = handle_client(stream, subscribers);
+                    let _ = handle_client(stream, subscribers)
+                        .map_err(move |e| {
+                            let _ = cloned_stream.write_all(format!("{}", e).as_bytes());
+                            let _ = cloned_stream.flush();
+                        });
                 });
             }
             Err(e) => return Err(e),
@@ -98,47 +110,44 @@ fn update_quotes(mut stock_exchange: StockExchange, generator: &QuoteGenerator, 
 }
 
 // Логика обработки подключившегося по TCP клиента
-fn handle_client(stream: TcpStream, subscribers: Subscribers) {
-    println!("Connection from {}", stream.peer_addr().unwrap());
+fn handle_client(stream: TcpStream, subscribers: Subscribers) -> io::Result<()> {
+    println!("Connection from {}", stream.peer_addr()?);
 
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
 
-    let mut writer = stream.try_clone().expect("failed to clone stream"); //убрать expect, завершать функцию с логом ошибки через логгер
+    let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
 
     let _ = writer.write_all(b"Welcome to streaming quotes server! Awaiting command...\n");
     let _ = writer.flush();
 
-    match StreamCommand::try_read_from_reader(&mut reader) {
-        Ok(command) => {
-            println!("Parsed command: {:?}", command);
+    let command = StreamCommand::try_read_from_reader(&mut reader)?;
 
-            let _ = writer.write_all(b"Ack\n");
-            let _ = writer.flush();
+    println!("Parsed command: {:?}", command);
 
-            thread::spawn(move || {
-                process_udp_streaming(subscribers, command);
-            });
-        }
-        Err(e) => {
-            eprintln!("Error parsing command: {}\n", e);
+    let socket = UdpSocket::bind("0.0.0.0:0")?; //Здесь не очень хорошо, что на клиент будут отправляться внутренние ошибки сервера, но пока ради упрощения решил оставить так
 
-            let _ = writer.write_all(format!("Error parsing command: {}\n", e).as_bytes());
-            let _ = writer.flush();
-        }
-    }
+    let _ = writer.write_all(b"Ack\n");
+    let _ = writer.flush();
+
+    thread::spawn(move || {
+        process_udp_streaming(subscribers, command, socket);
+    });
+
+    Ok(())
 }
 
-fn process_udp_streaming(subscribers: Subscribers, command: StreamCommand) {
-    let Ok(socket) = UdpSocket::bind("0.0.0.0:0") else {
-        eprintln!("Failed to bind UDP socket");
-        return ();
-    };
-
+fn process_udp_streaming(subscribers: Subscribers, command: StreamCommand, socket: UdpSocket, active_clients: ActiveClients, last_client_id: AtomicU64) {
     let (sender, receiver) = bounded::<Arc<HashMap<String, StockQuote>>>(CHANNEL_CAPACITY);
+
+    let client_id = last_client_id.fetch_add(1, Relaxed);
     {
+        //TODO заменить две блокировки одной в единой структуре, которая будет содержать обе коллекции и может быть счетчик
         let mut subscribers_lock = subscribers.write();
         subscribers_lock.push(sender);
+
+        let mut active_clients_lock = active_clients.write();
+        active_clients_lock.insert(client_id, true);
     }
 
     println!("Start processing UDP streaming...");
@@ -150,6 +159,9 @@ fn process_udp_streaming(subscribers: Subscribers, command: StreamCommand) {
                 //как только механизм ping/pong сообщает о неактивности клиента, надо удалить его из этой структуры
                 //здесь же перед отправкой данных надо проверять, активен ли еще клиент, и если нет, то просто дропнуть receiver.
                 //это автоматически удалит клиента из subscribers при следующем такте обновления котировок, в методе вектора retain
+                if !active_clients.read().contains_key(&client_id) {
+                    break;
+                }
 
                 let filtered_quotes: Vec<StockQuote> = command.quotes.iter()
                     .filter_map(|required_quote| all_quotes.get(required_quote).cloned())
