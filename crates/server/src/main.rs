@@ -1,27 +1,32 @@
 mod quote_generator;
 mod stock_exchange;
 
-use crate::stock_exchange::StockExchange;
 use crate::quote_generator::QuoteGenerator;
+use crate::stock_exchange::StockExchange;
 use crossbeam_channel::{bounded, Sender, TrySendError};
 use parking_lot::RwLock;
-use shared::{StockQuote, StreamCommand};
+use shared::{StockQuote, StreamCommand, PING_COMMAND};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{io, thread};
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering::Relaxed;
+use std::io::ErrorKind::InvalidData;
 
 type SenderInfo = Sender<Arc<HashMap<String, StockQuote>>>;
 type Subscribers = Arc<RwLock<Vec<SenderInfo>>>;
-type ActiveClients = Arc<RwLock<HashMap<u64, bool>>>;
 
 const TICKERS_FILE: &str = "tickers.txt";
+const QUOTES_UPDATE_DURATION: Duration = Duration::from_secs(5);
 const ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 7878);
 const CHANNEL_CAPACITY: usize = 20;
+
+const PING_COMMAND_SIZE: usize = 16;
+const TCP_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const UDP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() -> Result<(), io::Error> {
     let tickers = read_tickers(TICKERS_FILE)?;
@@ -29,10 +34,6 @@ fn main() -> Result<(), io::Error> {
 
     let generator = QuoteGenerator;
     let subscribers: Subscribers = Arc::new(RwLock::new(Vec::new()));
-
-    let last_client_id: AtomicU64 = AtomicU64::new(0); //последний использованный id для генерации нового
-    let active_clients: Arc<RwLock<HashMap<u64, bool>>> = Arc::new(RwLock::new(HashMap::new())); //id клиента - активен он или нет
-
     let subscribers_to_write = Arc::clone(&subscribers);
 
     //Поток обновления котировок - только он может записывать данные в биржу, а клиенты только читают
@@ -54,6 +55,7 @@ fn main() -> Result<(), io::Error> {
                         .map_err(move |e| {
                             let _ = cloned_stream.write_all(format!("{}", e).as_bytes());
                             let _ = cloned_stream.flush();
+                            eprintln!("Error handling client: {}", e);
                         });
                 });
             }
@@ -85,7 +87,7 @@ fn read_tickers(path: &str) -> io::Result<Vec<String>> {
     Ok(tickers)
 }
 
-fn update_quotes(mut stock_exchange: StockExchange, generator: &QuoteGenerator, subscribers: Arc<RwLock<Vec<SenderInfo>>>) {
+fn update_quotes(mut stock_exchange: StockExchange, generator: &QuoteGenerator, subscribers: Subscribers) {
     loop {
         stock_exchange.update_quotes(&generator);
         let snapshot = Arc::new(stock_exchange.quotes.clone());
@@ -105,7 +107,7 @@ fn update_quotes(mut stock_exchange: StockExchange, generator: &QuoteGenerator, 
             });
         }
 
-        thread::sleep(Duration::from_secs(5));
+        thread::sleep(QUOTES_UPDATE_DURATION);
     }
 }
 
@@ -113,7 +115,7 @@ fn update_quotes(mut stock_exchange: StockExchange, generator: &QuoteGenerator, 
 fn handle_client(stream: TcpStream, subscribers: Subscribers) -> io::Result<()> {
     println!("Connection from {}", stream.peer_addr()?);
 
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_read_timeout(Some(TCP_READ_TIMEOUT));
 
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
@@ -123,6 +125,10 @@ fn handle_client(stream: TcpStream, subscribers: Subscribers) -> io::Result<()> 
 
     let command = StreamCommand::try_read_from_reader(&mut reader)?;
 
+    if command.quotes.is_empty() {
+        return Err(io::Error::new(InvalidData, "Quotes list in command is empty"));
+    }
+
     println!("Parsed command: {:?}", command);
 
     let socket = UdpSocket::bind("0.0.0.0:0")?; //Здесь не очень хорошо, что на клиент будут отправляться внутренние ошибки сервера, но пока ради упрощения решил оставить так
@@ -131,41 +137,42 @@ fn handle_client(stream: TcpStream, subscribers: Subscribers) -> io::Result<()> 
     let _ = writer.flush();
 
     thread::spawn(move || {
-        process_udp_streaming(subscribers, command, socket);
+        let _ = process_udp_streaming(subscribers, command, socket);
     });
 
     Ok(())
 }
 
-fn process_udp_streaming(subscribers: Subscribers, command: StreamCommand, socket: UdpSocket, active_clients: ActiveClients, last_client_id: AtomicU64) {
-    let (sender, receiver) = bounded::<Arc<HashMap<String, StockQuote>>>(CHANNEL_CAPACITY);
+fn process_udp_streaming(subscribers: Subscribers, command: StreamCommand, socket: UdpSocket) -> io::Result<()> {
+    let socket_clone = socket.try_clone()?;
 
-    let client_id = last_client_id.fetch_add(1, Relaxed);
+    let (sender, receiver) = bounded::<Arc<HashMap<String, StockQuote>>>(CHANNEL_CAPACITY);
     {
-        //TODO заменить две блокировки одной в единой структуре, которая будет содержать обе коллекции и может быть счетчик
         let mut subscribers_lock = subscribers.write();
         subscribers_lock.push(sender);
-
-        let mut active_clients_lock = active_clients.write();
-        active_clients_lock.insert(client_id, true);
     }
+
+    let is_client_detached = Arc::new(AtomicBool::new(false));
+    let is_detached_clone = Arc::clone(&is_client_detached);
+
+    thread::spawn(move || {
+        listen_client_ping(socket_clone, is_detached_clone);
+    });
 
     println!("Start processing UDP streaming...");
 
     loop {
         match receiver.recv() {
             Ok(all_quotes) => {
-                //todo Для отслеживания, активен ли еще клиент, необходима отдельная структура данных, которая будет хранить активных клиентов
-                //как только механизм ping/pong сообщает о неактивности клиента, надо удалить его из этой структуры
-                //здесь же перед отправкой данных надо проверять, активен ли еще клиент, и если нет, то просто дропнуть receiver.
-                //это автоматически удалит клиента из subscribers при следующем такте обновления котировок, в методе вектора retain
-                if !active_clients.read().contains_key(&client_id) {
+                if is_client_detached.load(Relaxed) {
                     break;
                 }
 
                 let filtered_quotes: Vec<StockQuote> = command.quotes.iter()
                     .filter_map(|required_quote| all_quotes.get(required_quote).cloned())
                     .collect();
+
+                println!("Filtered quotes for {}: {:?}", command.address, filtered_quotes);
 
                 let payload_bytes: Vec<u8> = StockQuote::serialize(&filtered_quotes);
 
@@ -182,4 +189,31 @@ fn process_udp_streaming(subscribers: Subscribers, command: StreamCommand, socke
             }
         }
     }
+
+    Ok(())
+}
+
+fn listen_client_ping(socket: UdpSocket, is_client_detached: Arc<AtomicBool>) {
+    let mut buf = [0u8; PING_COMMAND_SIZE];
+    let _ = socket.set_read_timeout(Some(UDP_TIMEOUT));
+
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((size, _)) => {
+                let msg = String::from_utf8_lossy(&buf[..size]);
+
+                if msg.trim() != PING_COMMAND {
+                    eprintln!("Received invalid PING message: {}", msg);
+                    break;
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to read from socket: {}", e);
+                break;
+            }
+        }
+    }
+
+    println!("Client is detached, stopping UDP streaming...");
+    is_client_detached.store(true, Relaxed)
 }

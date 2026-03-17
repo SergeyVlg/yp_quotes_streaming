@@ -73,15 +73,18 @@ impl StreamCommand {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Empty quotes list"));
         }
 
-        let mut raw_quotes = parts[2].split(',');
+        let quotes: Vec<String> = parts[2]
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .collect();
 
-        if raw_quotes.any(|s| s.trim().is_empty()) {
+        if quotes.iter().any(|s| s.is_empty()) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Quotes list contains empty quote"));
         }
 
         Ok(StreamCommand {
             address,
-            quotes: raw_quotes.map(|s| s.trim().to_string()).collect()
+            quotes
         })
     }
 }
