@@ -1,11 +1,15 @@
 use clap::Parser;
-use shared::{StockQuote, StreamCommand};
+use shared::{AckResponse, StockQuote, StreamCommand, PING_COMMAND};
 use std::io::{BufRead, BufReader, Error, Write};
+use std::io::ErrorKind::ConnectionAborted;
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::thread;
+use std::time::Duration;
 
 const CLIENT_ADDRESS: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
+const QUOTES_BUFFER_SIZE: usize = 4096;
+const PING_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Parser, Debug)]
 struct Arguments {
@@ -68,44 +72,59 @@ fn main() -> std::io::Result<()> {
     stream.write_all(&command.to_bytes())?;
     stream.flush()?;
 
-    server_response.clear();
-    reader.read_line(&mut server_response)?;
+    let ack = AckResponse::try_read_from_reader(&mut reader)?;
+    let ping_address = ack.source_address;
 
-    if server_response.trim() != "Ack" {
-        return Err(Error::new(std::io::ErrorKind::InvalidData, format!("Ожидалось подтверждение от сервера, получено: {}", server_response.trim())));
+    let address = SocketAddrV4::new(CLIENT_ADDRESS, args.udp_port);
+    let Ok(socket) = UdpSocket::bind(address) else {
+        return Err(Error::new(std::io::ErrorKind::ConnectionRefused, format!("Failed to bind UDP socket to {}", address)));
+    };
+
+    println!("UDP socket opened");
+
+    let cloned_socket = socket.try_clone()?;
+    let join_handle = thread::spawn(move || receive_quotes(socket));
+    let ping_handle = thread::spawn(move || ping_server(cloned_socket, ping_address));
+
+    match join_handle.join() {
+        Ok(Err(e)) => return Err(Error::new(std::io::ErrorKind::ConnectionRefused, format!("Получение котировок завершилось с ошибкой: {}", e))),
+        Err(_) =>  return Err(Error::new(std::io::ErrorKind::Other,"Поток получения котировок запаниковал")),
+        _ => {},
+    };
+
+    match ping_handle.join() {
+        Ok(Err(e)) => return Err(Error::new(std::io::ErrorKind::ConnectionRefused, format!("Пинг сервера завершился с ошибкой: {}", e))),
+        Err(_) =>  return Err(Error::new(std::io::ErrorKind::Other,"Поток пинга сервера запаниковал")),
+        _ => {},
     }
 
-    let join_handle = thread::spawn(move || {
-        let address = SocketAddrV4::new(CLIENT_ADDRESS, args.udp_port);
-        let Ok(socket) = UdpSocket::bind(address) else {
-            eprintln!("Failed to bind UDP socket");
-            return ();
-        };
+    Ok(())
+}
 
-        println!("UDP socket opened");
-        let mut buf = [0u8; 4096];
+fn receive_quotes(socket: UdpSocket) -> std::io::Result<()> {
+    let mut buf = [0u8; QUOTES_BUFFER_SIZE];
 
-        loop {
-            match socket.recv_from(&mut buf) {
-                Ok((size, src)) => {
-                    StockQuote::try_deserialize(&buf[..size])
-                        .map(|quotes| {
-                            println!("Received quotes data:");
-                            quotes.iter().for_each(|quote| println!("{:?}", quote));
-                        })
-                        .unwrap_or_else(|e| {
-                            eprintln!("Failed to deserialize stock quotes: {}", e);
-                        });
-                }
-                Err(e) => {
-                    eprintln!("Failed to receive UDP packet: {}", e);
-                    break;
-                }
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((size, _)) => {
+                StockQuote::try_deserialize(&buf[..size])
+                    .map(|quotes| {
+                        println!("Received quotes data:");
+                        quotes.iter().for_each(|quote| println!("{:?}", quote));
+                    })?
+            }
+            Err(e) => {
+                return Err(Error::new(ConnectionAborted, format!("Failed to receive UDP packet: {}", e)));
             }
         }
-    });
+    }
+}
 
-    let _ = join_handle.join();
+fn ping_server(socket: UdpSocket, server_addr: SocketAddrV4) -> std::io::Result<()> {
+    loop {
+        println!("Send ping to server at address {} ...", server_addr);
+        socket.send_to(PING_COMMAND.as_bytes(), server_addr)?;
 
-    Ok(())
+        thread::sleep(PING_TIMEOUT);
+    }
 }

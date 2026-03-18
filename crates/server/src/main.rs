@@ -5,10 +5,10 @@ use crate::quote_generator::QuoteGenerator;
 use crate::stock_exchange::StockExchange;
 use crossbeam_channel::{bounded, Sender, TrySendError};
 use parking_lot::RwLock;
-use shared::{StockQuote, StreamCommand, PING_COMMAND};
+use shared::{AckResponse, StockQuote, StreamCommand, PING_COMMAND};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::atomic::{AtomicBool};
 use std::sync::Arc;
@@ -124,16 +124,21 @@ fn handle_client(stream: TcpStream, subscribers: Subscribers) -> io::Result<()> 
     let _ = writer.flush();
 
     let command = StreamCommand::try_read_from_reader(&mut reader)?;
-
     if command.quotes.is_empty() {
         return Err(io::Error::new(InvalidData, "Quotes list in command is empty"));
     }
 
     println!("Parsed command: {:?}", command);
 
-    let socket = UdpSocket::bind("0.0.0.0:0")?; //Здесь не очень хорошо, что на клиент будут отправляться внутренние ошибки сервера, но пока ради упрощения решил оставить так
+    let socket = UdpSocket::bind("127.0.0.1:0")?; //Здесь не очень хорошо, что на клиент будут отправляться внутренние ошибки сервера, но пока ради упрощения решил оставить так
+    let source_address = match socket.local_addr()? {
+        SocketAddr::V4(addr) => addr,
+        SocketAddr::V6(_) => return Err(io::Error::new(InvalidData,"UDP socket is not IPv4")),
+    };
 
-    let _ = writer.write_all(b"Ack\n");
+    let ack_response = AckResponse { source_address };
+
+    let _ = writer.write_all(&ack_response.to_bytes());
     let _ = writer.flush();
 
     thread::spawn(move || {
@@ -163,16 +168,12 @@ fn process_udp_streaming(subscribers: Subscribers, command: StreamCommand, socke
 
     loop {
         match receiver.recv() {
+            Ok(_) if is_client_detached.load(Relaxed) => break,
             Ok(all_quotes) => {
-                if is_client_detached.load(Relaxed) {
-                    break;
-                }
 
                 let filtered_quotes: Vec<StockQuote> = command.quotes.iter()
                     .filter_map(|required_quote| all_quotes.get(required_quote).cloned())
                     .collect();
-
-                println!("Filtered quotes for {}: {:?}", command.address, filtered_quotes);
 
                 let payload_bytes: Vec<u8> = StockQuote::serialize(&filtered_quotes);
 
