@@ -1,4 +1,5 @@
 use clap::Parser;
+use log::{debug, info, trace};
 use shared::{AckResponse, StockQuote, StreamCommand, PING_COMMAND};
 use std::io::{BufRead, BufReader, Error, Write};
 use std::io::ErrorKind::ConnectionAborted;
@@ -48,6 +49,8 @@ fn parse_existing_file(raw_path: &str) -> Result<PathBuf, String> {
 }
 
 fn main() -> std::io::Result<()> {
+    env_logger::init();
+
     let args = Arguments::parse();
 
     let tickets_file = std::fs::File::open(&args.tickers_file)?;
@@ -80,7 +83,7 @@ fn main() -> std::io::Result<()> {
         return Err(Error::new(std::io::ErrorKind::ConnectionRefused, format!("Failed to bind UDP socket to {}", address)));
     };
 
-    println!("UDP socket opened");
+    info!("UDP socket opened");
 
     let cloned_socket = socket.try_clone()?;
     let join_handle = thread::spawn(move || receive_quotes(socket));
@@ -109,8 +112,8 @@ fn receive_quotes(socket: UdpSocket) -> std::io::Result<()> {
             Ok((size, _)) => {
                 StockQuote::try_deserialize(&buf[..size])
                     .map(|quotes| {
-                        println!("Received quotes data:");
-                        quotes.iter().for_each(|quote| println!("{:?}", quote));
+                        debug!("Received quotes data");
+                        quotes.iter().for_each(|quote| debug!("{:?}", quote));
                     })?
             }
             Err(e) => {
@@ -122,7 +125,7 @@ fn receive_quotes(socket: UdpSocket) -> std::io::Result<()> {
 
 fn ping_server(socket: UdpSocket, server_addr: SocketAddrV4) -> std::io::Result<()> {
     loop {
-        println!("Send ping to server at address {} ...", server_addr);
+        trace!("Send ping to server at address {} ...", server_addr);
         socket.send_to(PING_COMMAND.as_bytes(), server_addr)?;
 
         thread::sleep(PING_TIMEOUT);

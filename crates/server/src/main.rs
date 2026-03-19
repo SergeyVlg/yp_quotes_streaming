@@ -4,6 +4,7 @@ mod stock_exchange;
 use crate::quote_generator::QuoteGenerator;
 use crate::stock_exchange::StockExchange;
 use crossbeam_channel::{bounded, Sender, TrySendError};
+use log::{debug, error, info, trace, warn};
 use parking_lot::RwLock;
 use shared::{AckResponse, StockQuote, StreamCommand, PING_COMMAND};
 use std::collections::HashMap;
@@ -29,6 +30,8 @@ const TCP_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const UDP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() -> Result<(), io::Error> {
+    env_logger::init();
+
     let tickers = read_tickers(TICKERS_FILE)?;
     let stock_exchange = StockExchange::new(tickers);
 
@@ -42,7 +45,7 @@ fn main() -> Result<(), io::Error> {
     });
 
     let listener = TcpListener::bind(ADDRESS)?;
-    println!("Server listening {}", ADDRESS);
+    info!("Server listening {}", ADDRESS);
 
     for stream in listener.incoming() {
         match stream {
@@ -55,7 +58,7 @@ fn main() -> Result<(), io::Error> {
                         .map_err(move |e| {
                             let _ = cloned_stream.write_all(format!("{}", e).as_bytes());
                             let _ = cloned_stream.flush();
-                            eprintln!("Error handling client: {}", e);
+                            error!("Error handling client: {}", e);
                         });
                 });
             }
@@ -81,7 +84,7 @@ fn read_tickers(path: &str) -> io::Result<Vec<String>> {
     }
 
     if tickers.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Файл с тикерами пустой: {}", path)));
+        return Err(io::Error::new(InvalidData, format!("Файл с тикерами пустой: {}", path)));
     }
 
     Ok(tickers)
@@ -113,7 +116,7 @@ fn update_quotes(mut stock_exchange: StockExchange, generator: &QuoteGenerator, 
 
 // Логика обработки подключившегося по TCP клиента
 fn handle_client(stream: TcpStream, subscribers: Subscribers) -> io::Result<()> {
-    println!("Connection from {}", stream.peer_addr()?);
+    info!("Connection from {}", stream.peer_addr()?);
 
     let _ = stream.set_read_timeout(Some(TCP_READ_TIMEOUT));
 
@@ -128,7 +131,7 @@ fn handle_client(stream: TcpStream, subscribers: Subscribers) -> io::Result<()> 
         return Err(io::Error::new(InvalidData, "Quotes list in command is empty"));
     }
 
-    println!("Parsed command: {:?}", command);
+    debug!("Parsed command: {:?}", command);
 
     let socket = UdpSocket::bind("127.0.0.1:0")?; //Здесь не очень хорошо, что на клиент будут отправляться внутренние ошибки сервера, но пока ради упрощения решил оставить так
     let source_address = match socket.local_addr()? {
@@ -164,7 +167,7 @@ fn process_udp_streaming(subscribers: Subscribers, command: StreamCommand, socke
         listen_client_ping(socket_clone, is_detached_clone);
     });
 
-    println!("Start processing UDP streaming...");
+    info!("Start processing UDP streaming...");
 
     loop {
         match receiver.recv() {
@@ -177,15 +180,15 @@ fn process_udp_streaming(subscribers: Subscribers, command: StreamCommand, socke
 
                 let payload_bytes: Vec<u8> = StockQuote::serialize(&filtered_quotes);
 
-                println!("Send quotes to {}: {:?}", command.address, filtered_quotes);
+                trace!("Send quotes to {}: {:?}", command.address, filtered_quotes);
 
                 if let Err(e) = socket.send_to(&payload_bytes, command.address) {
-                    eprintln!("Failed to send UDP packet: {}", e);
+                    error!("Failed to send UDP packet: {}", e);
                     break;
                 }
             }
             Err(e) => {
-                eprintln!("Failed to receive quotes from channel: {}", e);
+                error!("Failed to receive quotes from channel: {}", e);
                 break;
             }
         }
@@ -204,17 +207,17 @@ fn listen_client_ping(socket: UdpSocket, is_client_detached: Arc<AtomicBool>) {
                 let msg = String::from_utf8_lossy(&buf[..size]);
 
                 if msg.trim() != PING_COMMAND {
-                    eprintln!("Received invalid PING message: {}", msg);
+                    warn!("Received invalid PING message: {}", msg);
                     break;
                 }
             }
             Err(e) => {
-                eprintln!("Failed to read from socket: {}", e);
+                warn!("Failed to read from socket: {}", e);
                 break;
             }
         }
     }
 
-    println!("Client is detached, stopping UDP streaming...");
+    info!("Client is detached, stopping UDP streaming...");
     is_client_detached.store(true, Relaxed)
 }
