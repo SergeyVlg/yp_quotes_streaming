@@ -59,3 +59,122 @@ impl AckResponse {
         Ok(Self { source_address: address })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::AckResponse;
+    use std::io::{Cursor, ErrorKind};
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    #[test]
+    fn to_bytes_serializes_ack_with_newline() {
+        let response = AckResponse {
+            source_address: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080),
+        };
+
+        assert_eq!(response.to_bytes(), b"ACK|127.0.0.1:8080\n".to_vec());
+    }
+
+    #[test]
+    fn try_read_from_reader_parses_valid_ack() {
+        let mut cursor = Cursor::new(b"ACK|127.0.0.1:7878\n".to_vec());
+
+        let parsed = AckResponse::try_read_from_reader(&mut cursor).unwrap();
+
+        assert_eq!(
+            parsed.source_address,
+            SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 7878)
+        );
+    }
+
+    #[test]
+    fn try_read_from_reader_returns_unexpected_eof_for_empty_input() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+
+        let err = match AckResponse::try_read_from_reader(&mut cursor) {
+            Ok(_) => panic!("expected error for empty input"),
+            Err(e) => e,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn try_read_from_reader_returns_error_when_response_too_long() {
+        let mut cursor = Cursor::new(vec![b'a'; 257]);
+
+        let err = match AckResponse::try_read_from_reader(&mut cursor) {
+            Ok(_) => panic!("expected error for oversized ack response"),
+            Err(e) => e,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("too long"));
+    }
+
+    #[test]
+    fn try_read_from_reader_returns_error_when_newline_is_missing() {
+        let mut cursor = Cursor::new(b"ACK|127.0.0.1:7878".to_vec());
+
+        let err = match AckResponse::try_read_from_reader(&mut cursor) {
+            Ok(_) => panic!("expected error when newline is missing"),
+            Err(e) => e,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("newline not found"));
+    }
+
+    #[test]
+    fn try_read_from_reader_returns_error_for_invalid_utf8() {
+        let mut cursor = Cursor::new(vec![b'A', b'C', b'K', b'|', 0xFF, b'\n']);
+
+        let err = match AckResponse::try_read_from_reader(&mut cursor) {
+            Ok(_) => panic!("expected UTF-8 parsing error"),
+            Err(e) => e,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("Invalid UTF-8"));
+    }
+
+    #[test]
+    fn try_read_from_reader_returns_error_for_wrong_fields_count() {
+        let mut cursor = Cursor::new(b"ACK\n".to_vec());
+
+        let err = match AckResponse::try_read_from_reader(&mut cursor) {
+            Ok(_) => panic!("expected format error for wrong fields count"),
+            Err(e) => e,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("Invalid data format"));
+    }
+
+    #[test]
+    fn try_read_from_reader_returns_error_for_wrong_prefix() {
+        let mut cursor = Cursor::new(b"NACK|127.0.0.1:7878\n".to_vec());
+
+        let err = match AckResponse::try_read_from_reader(&mut cursor) {
+            Ok(_) => panic!("expected error for invalid ack prefix"),
+            Err(e) => e,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("Invalid ack response"));
+    }
+
+    #[test]
+    fn try_read_from_reader_returns_error_for_invalid_socket_address() {
+        let mut cursor = Cursor::new(b"ACK|not-an-address\n".to_vec());
+
+        let err = match AckResponse::try_read_from_reader(&mut cursor) {
+            Ok(_) => panic!("expected error for invalid socket address"),
+            Err(e) => e,
+        };
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("Invalid socket address format"));
+    }
+}
+
