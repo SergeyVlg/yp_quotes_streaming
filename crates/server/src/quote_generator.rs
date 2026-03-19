@@ -2,11 +2,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rand::RngExt;
 use shared::StockQuote;
 
-pub struct QuoteGenerator;
+pub(super) struct QuoteGenerator;
 
 impl QuoteGenerator {
 
-    pub fn generate_quote(&self, ticker: &str) -> StockQuote {
+    pub(super) fn generate_quote(&self, ticker: &str) -> StockQuote {
         let mut rng = rand::rng();
 
         let (base, spread) = match ticker {

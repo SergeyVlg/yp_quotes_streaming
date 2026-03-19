@@ -75,9 +75,12 @@ fn main() -> std::io::Result<()> {
     stream.write_all(&command.to_bytes())?;
     stream.flush()?;
 
+    //Ждем в ответе Ack с адресом и портом, куда можно будет слать Ping
     let ack = AckResponse::try_read_from_reader(&mut reader)?;
-    let ping_address = ack.source_address;
 
+    info!("Ack response received");
+
+    let ping_address = ack.source_address;
     let address = SocketAddrV4::new(CLIENT_ADDRESS, args.udp_port);
     let Ok(socket) = UdpSocket::bind(address) else {
         return Err(Error::new(std::io::ErrorKind::ConnectionRefused, format!("Failed to bind UDP socket to {}", address)));
