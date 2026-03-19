@@ -112,8 +112,8 @@ fn receive_quotes(socket: UdpSocket) -> std::io::Result<()> {
             Ok((size, _)) => {
                 StockQuote::try_deserialize(&buf[..size])
                     .map(|quotes| {
-                        debug!("Received quotes data");
-                        quotes.iter().for_each(|quote| debug!("{:?}", quote));
+                        info!("Received quotes data");
+                        quotes.iter().for_each(|quote| info!("{:?}", quote));
                     })?
             }
             Err(e) => {
