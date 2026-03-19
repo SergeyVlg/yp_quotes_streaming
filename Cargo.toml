@@ -1,6 +1,12 @@
-[package]
-name = "yp_quotes_streaming"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+	"crates/client",
+	"crates/server",
+	"crates/shared",
+]
+resolver = "2"
 
-[dependencies]
+[workspace.dependencies]
+env_logger = "0.11"
+log = "0.4"
+shared = { path = "crates/shared" }

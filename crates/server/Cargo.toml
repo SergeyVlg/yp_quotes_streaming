@@ -7,6 +7,6 @@ edition = "2024"
 rand = "0.10.0"
 parking_lot = "0.12.5"
 crossbeam-channel = "0.5.15"
-env_logger = "0.11"
-log = "0.4"
-shared = { path = "../shared" }
+env_logger.workspace = true
+log.workspace = true
+shared.workspace = true
